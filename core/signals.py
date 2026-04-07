@@ -5,30 +5,27 @@ import os
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from utils.math_utils import get_robust_pullback_low, calculate_atr
+from utils.math_utils import get_robust_pullback_low, calculate_atr, calculate_fractal_low
 
 class SignalGenerator:
-    def __init__(self, df: pd.DataFrame, config: dict):
+    def __init__(self, df: pd.DataFrame, config: dict, symbol: str = "BTC/USDT"):
         self.df = df
         self.config = config
+        self.symbol = symbol
         
         # --- Pre-compute all indicators (Vectorized) ---
-        # This avoids O(N) calculations inside the loop
         
         # 1. ATR
         self.df['atr'] = calculate_atr(self.df, 14)
         
         # 2. Breakout Signal Base (Rolling High)
-        # Lookback 20 bars (approx 1.5 hours for 5m)
         self.df['rolling_high'] = self.df['high'].rolling(window=20).max().shift(1)
         
-        # 3. Resistance Levels (Pre-calculated Rolling Maxs)
-        # TP1: Local High (20 bars)
-        # TP2: 4h High (48 bars)
-        # TP3: 12h High (144 bars)
-        # TP4: 24h High (288 bars)
-        # TP5: 48h High (576 bars)
+        # 3. Pre-compute Fractal Lows for Stop Loss (v2.5)
+        # Williams Fractal: 5-bar pattern (2 lower lows on each side)
+        self.df['fractal_low'] = calculate_fractal_low(self.df)
         
+        # 4. Resistance Levels (Pre-calculated Rolling Maxs)
         self.df['tp1_raw'] = self.df['high'].rolling(window=20).max().shift(1)
         self.df['tp2_raw'] = self.df['high'].rolling(window=48).max().shift(1)
         self.df['tp3_raw'] = self.df['high'].rolling(window=144).max().shift(1)
@@ -53,13 +50,19 @@ class SignalGenerator:
         # 1. Check Breakout
         if row['close'] > row['rolling_high']:
             
-            # 2. Calculate Stop Loss (Dynamic based on recent consolidation)
-            consolidation_window = self.df.iloc[max(0, idx-50) : idx]
-            if len(consolidation_window) < 5:
-                return None
-                
-            # Simple fast approximation: min of lows
-            sl_price = consolidation_window['low'].min() - row['atr'] * 0.5
+            # 2. Calculate Stop Loss using Fractal Low (v2.5)
+            # Use pre-computed fractal low if available, else fall back to recent low
+            fractal_sl = row['fractal_low']
+            atr_buffer = row['atr'] * 1.5  # 1.5 ATR buffer per spec
+            
+            if pd.notna(fractal_sl):
+                sl_price = fractal_sl - atr_buffer
+            else:
+                # Fallback: use recent consolidation low
+                consolidation_window = self.df.iloc[max(0, idx-30) : idx]
+                if len(consolidation_window) < 5:
+                    return None
+                sl_price = consolidation_window['low'].min() - atr_buffer
             
             risk_distance = row['close'] - sl_price
             if risk_distance <= 0 or pd.isna(risk_distance): 

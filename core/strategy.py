@@ -145,7 +145,8 @@ class S002Engine:
         self.taker_fee = config.get('taker_fee', 0.0005)
         self.maker_fee = config.get('maker_fee', 0.0002)
         
-    def run(self, df: pd.DataFrame, signal_generator=None):
+    def run(self, df: pd.DataFrame, signal_generator=None, symbol: str = "BTC/USDT"):
+        self.current_symbol = symbol
         for i in range(100, len(df)):
             bar = df.iloc[i]
             current_atr = df['atr'].iloc[i]
@@ -253,9 +254,9 @@ class S002Engine:
         initial_cost = instant_qty * entry_price
         self.balance -= initial_cost
         
-        # Create Position
+        # Create Position (v2.5: use current_symbol from run())
         pos = S002Position(
-            symbol=symbol, entry_price=entry_price, stop_price=signal['sl_price'],
+            symbol=self.current_symbol, entry_price=entry_price, stop_price=signal['sl_price'],
             quantity=total_qty, risk_distance=signal['risk_distance'], entry_time=entry_time,
             tp_levels=signal['tp_levels'], config=self.config
         )
@@ -265,7 +266,7 @@ class S002Engine:
         self.positions.append(pos)
         
         self.trades_log.append({
-            'symbol': symbol, 'type': 'MARKET_FILL',
+            'symbol': self.current_symbol, 'type': 'MARKET_FILL',
             'price': entry_price, 'qty': instant_qty, 'pnl': 0,
             'fee': instant_qty * entry_price * self.taker_fee
         })

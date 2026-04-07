@@ -130,10 +130,12 @@ def run_backtest():
             
             return signal
 
-    sig_gen = FilteredSignalGenerator(df, config)
+    # v2.5: Multi-symbol support - pass symbol to generator and engine
+    symbol = "BTC/USDT"
+    sig_gen = FilteredSignalGenerator(df, config, symbol=symbol)
     
     start_time = time.time()
-    engine.run(df, signal_generator=sig_gen)
+    engine.run(df, signal_generator=sig_gen, symbol=symbol)
     elapsed = time.time() - start_time
     
     print(f"\n" + "=" * 50)
