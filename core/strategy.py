@@ -42,24 +42,14 @@ class S002Position:
         
         # 1. Check Stop Loss (Hard Stop) - Uses Low for safety
         if bar['low'] <= self.stop_price:
-            return self.close_position(self.stop_price, 'STOP_LOSS', self.remaining_qty, trades)
+            return self.close_position(self.stop_price, 'STOP_LOSS', self.remaining_qty, trades, fee_rate=0.0005)
 
         # 2. Check Time Limit (Only if not profitable/TP1 not hit)
         if not self.tp1_triggered and self.hold_bars > self.max_hold_bars_unprofitable:
-            return self.close_position(bar['close'], 'TIME_STOP', self.remaining_qty, trades)
+            return self.close_position(bar['close'], 'TIME_STOP', self.remaining_qty, trades, fee_rate=0.0005)
 
-        # 3. Check Trailing Stop (TP6) - Only tightens after TP1
-        if self.tp1_triggered:
-            new_trailing = self.highest_price - (current_atr * self.trailing_atr_mult)
-            if new_trailing > self.trailing_stop_price:
-                self.trailing_stop_price = new_trailing
-            
-            # If trailing stop hit
-            if bar['low'] <= self.trailing_stop_price:
-                return self.close_position(self.trailing_stop_price, 'TRAILING_STOP', self.remaining_qty, trades)
-
-        # 4. Check Take Profits (TP1 - TP2)
-        # v2.1: 25% @ TP1, 25% @ TP2, 50% Trailing (TP6 handled above)
+        # 3. Check Take Profits (TP1 - TP2) FIRST (before trailing stop)
+        # v2.2: 25% @ TP1, 25% @ TP2, 50% Trailing (TP6 handled after)
         tp_ratio_map = {
             'TP1': 0.25, 
             'TP2': 0.25
@@ -76,13 +66,20 @@ class S002Position:
                     
                     if close_qty > 0.0001:
                         self.tp_statuses[tp_name] = True
+                        gross_pnl = (tp_price - self.entry_price) * close_qty
+                        notional = tp_price * close_qty
+                        fee = notional * 0.0002  # Maker fee for TP
+                        net_pnl = gross_pnl - fee
+                        
                         trades.append({
                             'symbol': self.symbol,
                             'type': 'TP',
                             'level': tp_name,
                             'price': tp_price,
                             'qty': close_qty,
-                            'pnl': (tp_price - self.entry_price) * close_qty
+                            'gross_pnl': gross_pnl,
+                            'fee': fee,
+                            'pnl': net_pnl
                         })
                         self.remaining_qty -= close_qty
                         
@@ -97,17 +94,34 @@ class S002Position:
                         if self.remaining_qty <= 0.0001:
                             return trades
 
+        # 4. Check Trailing Stop (TP6) - AFTER TP checks
+        if self.tp1_triggered and self.remaining_qty > 0.0001:
+            new_trailing = self.highest_price - (current_atr * self.trailing_atr_mult)
+            if new_trailing > self.trailing_stop_price:
+                self.trailing_stop_price = new_trailing
+            
+            # If trailing stop hit
+            if bar['low'] <= self.trailing_stop_price:
+                return self.close_position(self.trailing_stop_price, 'TRAILING_STOP', self.remaining_qty, trades, fee_rate=0.0005)
+
         return trades
 
-    def close_position(self, price: float, reason: str, qty: float, trades: list):
-        pnl = (price - self.entry_price) * qty
+    def close_position(self, price: float, reason: str, qty: float, trades: list, fee_rate: float = 0.0005):
+        """Close position, calculate PnL and fee. Returns trades list."""
+        gross_pnl = (price - self.entry_price) * qty
+        notional = price * qty
+        fee = notional * fee_rate
+        net_pnl = gross_pnl - fee
+        
         trades.append({
             'symbol': self.symbol,
             'type': 'EXIT',
             'level': reason,
             'price': price,
             'qty': qty,
-            'pnl': pnl
+            'gross_pnl': gross_pnl,
+            'fee': fee,
+            'pnl': net_pnl
         })
         self.remaining_qty = 0
         return trades
@@ -115,15 +129,21 @@ class S002Position:
 
 class S002Engine:
     """
-    Main Backtest Engine v2.1.
+    Main Backtest Engine v2.2.
+    Fixes: Balance tracking, Fee model, TP/Trailing order.
     """
     def __init__(self, config: dict):
         self.config = config
         self.positions: list[S002Position] = []
         self.pending_orders = [] 
         self.balance = 10000.0
+        self.initial_balance = 10000.0
         self.trades_log = []
         self.max_concurrent_positions = config.get('max_concurrent_positions', 3)
+        
+        # Fee model: taker 0.05%, maker 0.02%
+        self.taker_fee = config.get('taker_fee', 0.0005)
+        self.maker_fee = config.get('maker_fee', 0.0002)
         
     def run(self, df: pd.DataFrame, signal_generator=None):
         for i in range(100, len(df)):
@@ -163,9 +183,17 @@ class S002Engine:
                 if pos.remaining_qty > 0:
                     trades = pos.update(bar, current_atr)
                     for t in trades:
-                        if t['type'] == 'EXIT' or t['type'] == 'LIMIT_FILL': # Limit fill doesn't affect balance PnL
-                             if t['type'] == 'EXIT':
-                                self.balance += t['pnl']
+                        if t['type'] == 'EXIT' or t['type'] == 'TP':
+                            # EXIT/TP: realize PnL and return margin to balance
+                            # Margin returned = qty * exit_price
+                            margin_returned = t['qty'] * t['price']
+                            self.balance += (margin_returned + t['pnl'])
+                        elif t['type'] == 'LIMIT_FILL':
+                            # Limit fill: deduct cost + maker fee from balance
+                            fill_cost = t['qty'] * t['price']
+                            maker_fee = fill_cost * self.maker_fee
+                            self.balance -= (fill_cost + maker_fee)
+                            t['fee'] = maker_fee
                     self.trades_log.extend(trades)
                     
                     if pos.remaining_qty > 0:
@@ -182,16 +210,21 @@ class S002Engine:
 
         return self.trades_log
 
-    def open_hybrid_position(self, signal: dict, entry_time: pd.Timestamp):
-        symbol = "BTC/USDT" 
+    def open_hybrid_position(self, signal: dict, entry_time: pd.Timestamp, symbol: str = "BTC/USDT"):
         entry_price = signal['entry_price']
         
-        # Risk calc
-        total_qty = (self.balance * self.config['risk_per_trade']) / signal['risk_distance']
+        # Risk calc based on CURRENT balance (updates as trades close)
+        risk_amount = self.balance * self.config['risk_per_trade']
+        total_qty = risk_amount / signal['risk_distance']
         
-        # v2.1: 50/50 Split
+        # v2.2: 50/50 Split
         instant_qty = total_qty * 0.50
         limit_qty = total_qty * 0.50
+        
+        # Deduct initial margin + taker fee from balance
+        initial_cost = instant_qty * entry_price
+        taker_cost = initial_cost * self.taker_fee
+        self.balance -= (initial_cost + taker_cost)
         
         # Create Position
         pos = S002Position(
@@ -206,7 +239,8 @@ class S002Engine:
         
         self.trades_log.append({
             'symbol': symbol, 'type': 'MARKET_FILL',
-            'price': entry_price, 'qty': instant_qty, 'pnl': 0
+            'price': entry_price, 'qty': instant_qty, 'pnl': 0,
+            'fee': taker_cost
         })
         
         # Place Pending Limit Order
@@ -217,3 +251,4 @@ class S002Engine:
         
         print(f"[{entry_time}] SIGNAL: Entry @ {entry_price:.2f}, SL @ {signal['sl_price']:.2f}")
         print(f"           Instant 50% ({instant_qty:.2f}), Limit 50% @ {signal['limit_price']:.2f}")
+        print(f"           Balance after entry: {self.balance:.2f} (fee: {taker_cost:.2f})")

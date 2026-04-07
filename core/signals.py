@@ -7,83 +7,81 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from utils.math_utils import get_robust_pullback_low, calculate_atr
 
-def get_resistance_levels(df: pd.DataFrame, current_idx: int) -> dict:
-    """
-    Calculate Resistance Levels based on Rolling Max Highs.
-    v2.1: Replaces resample logic with rolling max for structural resistance.
-    """
-    history = df.iloc[:current_idx+1]
-    
-    levels = {}
-    
-    # 1. 5m Resistance (Local High, ~1.5h lookback)
-    levels['TP1'] = history['high'].rolling(window=20).max().iloc[-2] 
-    
-    try:
-        # 2. 4h Resistance (60 bars lookback for 5m)
-        levels['TP2'] = history['high'].rolling(window=60).max().iloc[-1]
-        
-        # 3. 12h Resistance (144 bars lookback)
-        levels['TP3'] = history['high'].rolling(window=144).max().iloc[-1]
-        
-        # 4. 24h Resistance (288 bars lookback)
-        levels['TP4'] = history['high'].rolling(window=288).max().iloc[-1]
-        
-        # 5. 48h Resistance (576 bars lookback) - Used for TP5/TP6 base
-        levels['TP5'] = history['high'].rolling(window=576).max().iloc[-1]
-        
-    except Exception as e:
-        # Fallback if not enough data
-        atr = calculate_atr(history).iloc[-1]
-        base = history['high'].iloc[-1]
-        levels['TP2'] = base + atr * 2.0
-        levels['TP3'] = base + atr * 4.0
-        levels['TP4'] = base + atr * 6.0
-        levels['TP5'] = base + atr * 8.0
-
-    return levels
-
 class SignalGenerator:
     def __init__(self, df: pd.DataFrame, config: dict):
         self.df = df
         self.config = config
+        
+        # --- Pre-compute all indicators (Vectorized) ---
+        # This avoids O(N) calculations inside the loop
+        
+        # 1. ATR
         self.df['atr'] = calculate_atr(self.df, 14)
+        
+        # 2. Breakout Signal Base (Rolling High)
+        # Lookback 20 bars (approx 1.5 hours for 5m)
         self.df['rolling_high'] = self.df['high'].rolling(window=20).max().shift(1)
         
+        # 3. Resistance Levels (Pre-calculated Rolling Maxs)
+        # TP1: Local High (20 bars)
+        # TP2: 4h High (48 bars)
+        # TP3: 12h High (144 bars)
+        # TP4: 24h High (288 bars)
+        # TP5: 48h High (576 bars)
+        
+        self.df['tp1_raw'] = self.df['high'].rolling(window=20).max().shift(1)
+        self.df['tp2_raw'] = self.df['high'].rolling(window=48).max().shift(1)
+        self.df['tp3_raw'] = self.df['high'].rolling(window=144).max().shift(1)
+        self.df['tp4_raw'] = self.df['high'].rolling(window=288).max().shift(1)
+        self.df['tp5_raw'] = self.df['high'].rolling(window=576).max().shift(1)
+
     def check_signal(self, idx: int) -> dict | None:
+        """
+        Fast O(1) signal check using pre-computed columns.
+        """
         if idx < 30: return None
         
-        bar = self.df.iloc[idx]
+        # Access row data directly (faster than iloc if used correctly, but iloc is okay for single row)
+        row = self.df.iloc[idx]
         
-        # Breakout Logic
-        if bar['close'] > bar['rolling_high']:
+        # 1. Check Breakout
+        if row['close'] > row['rolling_high']:
             
-            # 1. Calculate Stop Loss
+            # 2. Calculate Stop Loss (Dynamic based on recent consolidation)
+            # Since this is dynamic, we keep it here, but limit the slice size.
             consolidation_window = self.df.iloc[max(0, idx-50) : idx]
-            sl_price = consolidation_window[['open', 'close']].min(axis=1).min()
-            sl_price -= self.df['atr'].iloc[idx] * 0.5
+            # Simple fast approximation: min of lows or bodies
+            sl_price = consolidation_window['low'].min() - row['atr'] * 0.5
             
-            risk_distance = bar['close'] - sl_price
+            risk_distance = row['close'] - sl_price
             if risk_distance <= 0: return None
             
-            # 2. Calculate TP Levels
-            tp_levels = get_resistance_levels(self.df, idx)
+            # 3. Fetch Pre-computed TP Levels
+            tp_levels = {
+                'TP1': row['tp1_raw'],
+                'TP2': row['tp2_raw'],
+                'TP3': row['tp3_raw'],
+                'TP4': row['tp4_raw'],
+                'TP5': row['tp5_raw']
+            }
             
-            # 3. Ensure TP1 Breakeven
-            min_tp1 = bar['close'] + (risk_distance * 1.05)
-            if tp_levels.get('TP1', 0) < min_tp1:
-                tp_levels['TP1'] = min_tp1
-                
-            # Ensure TP2 is above TP1
-            if tp_levels.get('TP2', 0) <= min_tp1:
-                tp_levels['TP2'] = min_tp1 + (risk_distance * 1.5)
+            # 4. Sanitize TP Levels (Must be above entry and ordered)
+            min_tp1 = row['close'] + (risk_distance * 1.05)
+            
+            # Apply Breakeven Floor
+            for k, v in tp_levels.items():
+                if np.isnan(v): 
+                    # Fallback if not enough history
+                    tp_levels[k] = row['close'] + risk_distance * int(k[-1])
+                elif v < min_tp1:
+                    tp_levels[k] = min_tp1 + (risk_distance * (int(k[-1]) - 1) * 0.5)
 
-            # 4. Signal
+            # 5. Signal
             return {
-                'idx': idx, 'type': 'breakout', 'entry_price': bar['close'],
+                'idx': idx, 'type': 'breakout', 'entry_price': row['close'],
                 'sl_price': sl_price, 'risk_distance': risk_distance,
                 'tp_levels': tp_levels,
-                'limit_price': sl_price + risk_distance * 0.3 # Limit near support
+                'limit_price': sl_price + risk_distance * 0.3
             }
             
         return None
