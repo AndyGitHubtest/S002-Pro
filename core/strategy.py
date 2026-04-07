@@ -180,23 +180,26 @@ class S002Engine:
             # 2. Update existing positions & Balance
             open_pos = []
             for pos in self.positions:
-                if pos.remaining_qty > 0:
+                if pos.remaining_qty > 0 and not pd.isna(pos.remaining_qty):
                     trades = pos.update(bar, current_atr)
                     for t in trades:
+                        if pd.isna(t.get('qty')) or pd.isna(t.get('price')):
+                            continue
                         if t['type'] == 'EXIT' or t['type'] == 'TP':
-                            # EXIT/TP: realize PnL and return margin to balance
-                            # Margin returned = qty * exit_price
-                            margin_returned = t['qty'] * t['price']
-                            self.balance += (margin_returned + t['pnl'])
+                            # EXIT/TP: add proceeds back to balance (PnL is just stats)
+                            # Net proceeds = qty * exit_price - fee
+                            proceeds = t['qty'] * t['price']
+                            fee = t.get('fee', 0)
+                            if not pd.isna(proceeds) and not pd.isna(fee):
+                                self.balance += (proceeds - fee)
                         elif t['type'] == 'LIMIT_FILL':
-                            # Limit fill: deduct cost + maker fee from balance
+                            # Limit fill: deduct cost from balance
                             fill_cost = t['qty'] * t['price']
-                            maker_fee = fill_cost * self.maker_fee
-                            self.balance -= (fill_cost + maker_fee)
-                            t['fee'] = maker_fee
+                            if not pd.isna(fill_cost):
+                                self.balance -= fill_cost  # Fee already deducted in close_position
                     self.trades_log.extend(trades)
                     
-                    if pos.remaining_qty > 0:
+                    if pos.remaining_qty > 0.0001 and not pd.isna(pos.remaining_qty):
                         open_pos.append(pos)
             self.positions = open_pos
             
@@ -213,18 +216,35 @@ class S002Engine:
     def open_hybrid_position(self, signal: dict, entry_time: pd.Timestamp, symbol: str = "BTC/USDT"):
         entry_price = signal['entry_price']
         
+        # Validate balance
+        if pd.isna(self.balance) or self.balance <= 0:
+            print(f"[{entry_time}] ERROR: Invalid balance {self.balance}, skipping signal")
+            return
+        
         # Risk calc based on CURRENT balance (updates as trades close)
         risk_amount = self.balance * self.config['risk_per_trade']
-        total_qty = risk_amount / signal['risk_distance']
+        risk_distance = signal['risk_distance']
+        
+        # Validate risk distance
+        if risk_distance <= 0 or pd.isna(risk_distance):
+            print(f"[{entry_time}] ERROR: Invalid risk_distance {risk_distance}")
+            return
+        
+        total_qty = risk_amount / risk_distance
+        
+        # Sanity check on position size
+        max_qty = (self.balance * 2.0) / entry_price  # Max 2x balance (using leverage)
+        if total_qty <= 0 or pd.isna(total_qty) or total_qty > max_qty:
+            print(f"[{entry_time}] ERROR: Position size {total_qty:.4f} invalid or exceeds max {max_qty:.4f}, skipping")
+            return
         
         # v2.2: 50/50 Split
         instant_qty = total_qty * 0.50
         limit_qty = total_qty * 0.50
         
-        # Deduct initial margin + taker fee from balance
+        # Deduct initial margin from balance (fee is separate)
         initial_cost = instant_qty * entry_price
-        taker_cost = initial_cost * self.taker_fee
-        self.balance -= (initial_cost + taker_cost)
+        self.balance -= initial_cost
         
         # Create Position
         pos = S002Position(
@@ -240,7 +260,7 @@ class S002Engine:
         self.trades_log.append({
             'symbol': symbol, 'type': 'MARKET_FILL',
             'price': entry_price, 'qty': instant_qty, 'pnl': 0,
-            'fee': taker_cost
+            'fee': instant_qty * entry_price * self.taker_fee
         })
         
         # Place Pending Limit Order
@@ -249,6 +269,7 @@ class S002Engine:
             'unfilled_qty': limit_qty, 'age': 0
         })
         
+        entry_fee = instant_qty * entry_price * self.taker_fee
         print(f"[{entry_time}] SIGNAL: Entry @ {entry_price:.2f}, SL @ {signal['sl_price']:.2f}")
-        print(f"           Instant 50% ({instant_qty:.2f}), Limit 50% @ {signal['limit_price']:.2f}")
-        print(f"           Balance after entry: {self.balance:.2f} (fee: {taker_cost:.2f})")
+        print(f"           Instant 50% ({instant_qty:.4f}), Limit 50% @ {signal['limit_price']:.2f}")
+        print(f"           Balance after entry: {self.balance:.2f} (fee: {entry_fee:.2f})")

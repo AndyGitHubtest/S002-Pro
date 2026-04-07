@@ -41,20 +41,32 @@ class SignalGenerator:
         """
         if idx < 30: return None
         
-        # Access row data directly (faster than iloc if used correctly, but iloc is okay for single row)
+        # Access row data directly
         row = self.df.iloc[idx]
+        
+        # Validate data
+        if pd.isna(row['close']) or pd.isna(row['rolling_high']) or pd.isna(row['atr']):
+            return None
+        if row['atr'] <= 0:
+            return None
         
         # 1. Check Breakout
         if row['close'] > row['rolling_high']:
             
             # 2. Calculate Stop Loss (Dynamic based on recent consolidation)
-            # Since this is dynamic, we keep it here, but limit the slice size.
             consolidation_window = self.df.iloc[max(0, idx-50) : idx]
-            # Simple fast approximation: min of lows or bodies
+            if len(consolidation_window) < 5:
+                return None
+                
+            # Simple fast approximation: min of lows
             sl_price = consolidation_window['low'].min() - row['atr'] * 0.5
             
             risk_distance = row['close'] - sl_price
-            if risk_distance <= 0: return None
+            if risk_distance <= 0 or pd.isna(risk_distance): 
+                return None
+            # Prevent extreme risk distances
+            if risk_distance > row['close'] * 0.1:  # Max 10% stop
+                return None
             
             # 3. Fetch Pre-computed TP Levels
             tp_levels = {
