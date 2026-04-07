@@ -232,10 +232,17 @@ class S002Engine:
         
         total_qty = risk_amount / risk_distance
         
-        # Sanity check on position size
-        max_qty = (self.balance * 2.0) / entry_price  # Max 2x balance (using leverage)
-        if total_qty <= 0 or pd.isna(total_qty) or total_qty > max_qty:
-            print(f"[{entry_time}] ERROR: Position size {total_qty:.4f} invalid or exceeds max {max_qty:.4f}, skipping")
+        # Sanity check on position size - use absolute dollar limit
+        max_position_value = self.balance * 1.0  # Max 1x balance per position
+        position_value = total_qty * entry_price
+        
+        if total_qty <= 0 or pd.isna(total_qty) or position_value > max_position_value:
+            # Skip if position too large
+            return
+        
+        # Also check risk_distance is reasonable (at least 0.5% of price)
+        min_risk_distance = entry_price * 0.005
+        if risk_distance < min_risk_distance:
             return
         
         # v2.2: 50/50 Split
